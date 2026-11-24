@@ -681,6 +681,13 @@ CHECK:
 
 	ret.MFAMethods = permissions.MFAMethods
 	ret.ControlGroup = permissions.ControlGroup
+	// Surface the matched capability bitmap only when a control group is
+	// attached, so control group enforcement can tell which capabilities the
+	// matched permission actually grants. This is additive: fields other
+	// consumers read are unchanged.
+	if permissions.ControlGroup != nil {
+		ret.CapabilitiesBitmap = permissions.CapabilitiesBitmap
+	}
 
 	var grantingPolicies []logical.PolicyInfo
 	operationAllowed := false

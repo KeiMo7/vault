@@ -164,7 +164,14 @@ type PathRules struct {
 }
 
 type ControlGroupHCL struct {
-	TTL     interface{}                    `hcl:"ttl"`
+	// TTL is the legacy spelling of the control group lifetime. New policies
+	// should use MaxTTL; both are accepted for backwards compatibility.
+	TTL interface{} `hcl:"ttl"`
+
+	// MaxTTL is the maximum amount of time a request may wait for approvals
+	// before it expires.
+	MaxTTL interface{} `hcl:"max_ttl"`
+
 	Factors map[string]*ControlGroupFactor `hcl:"factor"`
 }
 
@@ -498,36 +505,76 @@ func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, en
 		}
 		if pc.ControlGroupHCL != nil {
 			pc.Permissions.ControlGroup = new(ControlGroup)
+			// max_ttl (preferred) and ttl (legacy) both set the lifetime; when
+			// both are present they must agree rather than silently picking one.
+			ttlSet := pc.ControlGroupHCL.TTL != nil
+			maxTTLSet := pc.ControlGroupHCL.MaxTTL != nil
+			if ttlSet && maxTTLSet {
+				return fmt.Errorf("control_group: use only one of ttl or max_ttl, found both")
+			}
+			if rawTTL := pc.ControlGroupHCL.MaxTTL; rawTTL != nil {
+				dur, err := parseutil.ParseDurationSecond(rawTTL)
+				if err != nil {
+					return fmt.Errorf("error parsing control group max ttl: %w", err)
+				}
+				if dur < 0 {
+					return fmt.Errorf("control_group: max_ttl cannot be negative")
+				}
+				pc.Permissions.ControlGroup.TTL = dur
+			}
 			if pc.ControlGroupHCL.TTL != nil {
 				dur, err := parseutil.ParseDurationSecond(pc.ControlGroupHCL.TTL)
 				if err != nil {
 					return fmt.Errorf("error parsing control group max ttl: %w", err)
 				}
+				if dur < 0 {
+					return fmt.Errorf("control_group: ttl cannot be negative")
+				}
 				pc.Permissions.ControlGroup.TTL = dur
 			}
+			// A missing max_ttl is permitted for backwards compatibility; at
+			// request time it falls back to a built-in default. A negative value
+			// is a misconfiguration and is rejected here.
 			var factors []*ControlGroupFactor
 			if pc.ControlGroupHCL.Factors != nil {
 				for key, factor := range pc.ControlGroupHCL.Factors {
 					// Although we only have one factor here, we need to check to make sure there is at least
 					// one factor defined in this factor block.
-					if factor.Identity == nil {
+					if factor == nil || factor.Identity == nil {
 						return errors.New("no control_group factor provided")
 					}
 
-					if factor.Identity.ApprovalsRequired <= 0 ||
-						(len(factor.Identity.GroupIDs) == 0 && len(factor.Identity.GroupNames) == 0) {
-						return errors.New("must provide more than one identity group and approvals > 0")
+					if strings.TrimSpace(key) == "" {
+						return errors.New("control_group: factor name cannot be empty")
+					}
+
+					// A factor is one approval set. Its approvals requirement must be
+					// satisfiable by the identities it names, otherwise the request can
+					// never be approved; reject that at write time rather than letting
+					// it deadlock at runtime.
+					identityGroups := append(append([]string{}, factor.Identity.GroupIDs...),
+						factor.Identity.GroupNames...)
+					if factor.Identity.ApprovalsRequired <= 0 {
+						return fmt.Errorf("control_group: factor %q must set approvals > 0", key)
+					}
+					if len(identityGroups) == 0 {
+						return fmt.Errorf("control_group: factor %q must name at least one group in group_ids or group_names", key)
+					}
+					for _, id := range identityGroups {
+						if strings.TrimSpace(id) == "" {
+							return fmt.Errorf("control_group: factor %q has an empty identity group", key)
+						}
 					}
 
 					// Ensure that configured ControlledCapabilities for factor are a subset of the
 					// Capabilities of the policy.
 					if len(factor.ControlledCapabilities) > 0 {
-						var found bool
 						for _, controlledCapability := range factor.ControlledCapabilities {
-							found = false
+							var found bool
 							for _, policyCap := range pc.Capabilities {
 								if controlledCapability == policyCap {
 									found = true
+									break
 								}
 							}
 							if !found {

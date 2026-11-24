@@ -450,6 +450,11 @@ type Core struct {
 	// systemBarrierView is the barrier view for the system backend
 	systemBarrierView *BarrierView
 
+	// controlGroup tracks pending control group requests and their in-process
+	// synchronization. It is created with the Core and has no storage of its
+	// own; pending requests live under systemBarrierView.
+	controlGroup *controlGroupManager
+
 	// expiration manager is used for managing LeaseIDs,
 	// renewal, expiration and revocation
 	expiration *ExpirationManager
@@ -1238,6 +1243,7 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		disableAutopilot:                conf.DisableAutopilot,
 		allowAuditLogPrefixing:          conf.AllowAuditLogPrefixing,
 		enableResponseHeaderHostname:    conf.EnableResponseHeaderHostname,
+		controlGroup:                    newControlGroupManager(),
 		enableResponseHeaderRaftNodeID:  conf.EnableResponseHeaderRaftNodeID,
 		mountMigrationTracker:           &sync.Map{},
 		disableSSCTokens:                conf.DisableSSCTokens,

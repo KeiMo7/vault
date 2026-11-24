@@ -759,6 +759,14 @@ func (c *Core) CheckToken(ctx context.Context, req *logical.Request, unauth bool
 		auth.PolicyResults.GrantingPolicies = append(auth.PolicyResults.GrantingPolicies, authResults.SentinelResults.GrantingPolicies...)
 	}
 
+	// If the matched permission requires approvals, surface that to the caller
+	// now, while the ACL results are already in hand. handleRequest turns this
+	// sentinel into a durable pending request; no extra policy evaluation is
+	// performed there. Uncontrolled requests skip this branch entirely.
+	if controlGroupCheckNeeded(authResults, req) {
+		return auth, te, ErrControlGroupPending
+	}
+
 	c.activityLogLock.RLock()
 	activityLog := c.activityLog
 	c.activityLogLock.RUnlock()
@@ -1382,6 +1390,28 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 		req.ClientTokenRemainingUses = materializedReq.ClientTokenRemainingUses
 		req.SetTokenEntry(materializedReq.TokenEntry())
 		te = req.TokenEntry()
+	}
+
+	// A request held for control group approval must not consume the caller's
+	// token uses: it did not execute. Handle it here, before UseToken, so the
+	// requester can still use their token while waiting. Requests that do not
+	// require a control group never reach this branch.
+	if errors.Is(ctErr, ErrControlGroupPending) {
+		newCtErr, cgResp, cgAuth, cgRetErr := checkNeedsCG(ctx, c, req, auth, nil, nonHMACReqDataKeys)
+		if cgRetErr != nil {
+			retErr = multierror.Append(retErr, cgRetErr)
+		}
+		switch {
+		case cgResp != nil || cgAuth != nil:
+			// A pending request is a successful response carrying the
+			// control-group token in wrap_info; clients detect it the same way
+			// they detect any wrapped response.
+			return cgResp, cgAuth, retErr
+		case newCtErr != nil:
+			return logical.ErrorResponse(newCtErr.Error()), auth, newCtErr
+		default:
+			return nil, auth, ctErr
+		}
 	}
 
 	// We run this logic first because we want to decrement the use count even

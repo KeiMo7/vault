@@ -5,7 +5,6 @@ package vault
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -48,8 +47,8 @@ var (
 	addSentinelPolicyData     = func(map[string]interface{}, *Policy) {}
 	inputSentinelPolicyData   = func(*framework.FieldData, *Policy) *logical.Response { return nil }
 
-	controlGroupUnwrap = func(context.Context, *SystemBackend, string, bool) (string, error) {
-		return "", errors.New("control groups unavailable")
+	controlGroupUnwrap = func(ctx context.Context, b *SystemBackend, accessor string, thirdParty bool) (string, error) {
+		return b.controlGroupUnwrap(ctx, accessor, thirdParty)
 	}
 
 	pathInternalUINamespacesRead = func(b *SystemBackend) framework.OperationFunc {
@@ -237,12 +236,9 @@ var (
 			"mfa/method/pingid/" + framework.GenericNameRegex("name"):                    {parameters: []string{"name"}, operations: []logical.Operation{logical.DeleteOperation, logical.ReadOperation, logical.UpdateOperation}},
 		})...)
 
-		// control-group paths
-		paths = append(paths, buildEnterpriseOnlyPaths(map[string]enterprisePathStub{
-			"control-group/authorize": {operations: []logical.Operation{logical.UpdateOperation}},
-			"control-group/request":   {operations: []logical.Operation{logical.UpdateOperation}},
-			"config/control-group":    {operations: []logical.Operation{logical.DeleteOperation, logical.ReadOperation, logical.UpdateOperation}},
-		})...)
+		// control-group paths are implemented in control_group.go and appended
+		// from operatorSystemBackendPaths; the sys/config/control-group endpoint
+		// is registered there as well.
 
 		// sentinel paths
 		paths = append(paths, buildEnterpriseOnlyPaths(map[string]enterprisePathStub{
@@ -302,8 +298,30 @@ func ceSysInitialize(b *SystemBackend) func(context.Context, *logical.Initializa
 		b.Core.certCountManager.StartConsumerJob(func(increment logical.CertCount) {
 			b.Core.ConsumeCertCounts(increment, true)
 		})
+
+		// Load the cluster-wide control group configuration and start the
+		// background sweeper that reclaims expired pending requests.
+		b.Core.loadControlGroupConfig(ctx)
+		b.Core.startControlGroupSweeper()
 		return nil
 	}
+}
+
+// startControlGroupSweeper launches the background reclaimer of expired pending
+// requests. It is idempotent and its lifetime is tied to the core's active
+// context, so it stops on seal/step-down.
+func (c *Core) startControlGroupSweeper() {
+	if c.controlGroup == nil || c.activeContext == nil {
+		return
+	}
+	c.controlGroup.lock.Lock()
+	defer c.controlGroup.lock.Unlock()
+	if c.controlGroup.sweepCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(c.activeContext)
+	c.controlGroup.sweepCancel = cancel
+	go c.sweepControlGroups(ctx)
 }
 
 // ConsumeCertCounts updates the certificate counts in storage if we are

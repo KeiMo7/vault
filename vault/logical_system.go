@@ -259,6 +259,7 @@ func NewSystemBackend(core *Core, logger log.Logger, config *logical.BackendConf
 func operatorSystemBackendPaths(b *SystemBackend) []*framework.Path {
 	var ret []*framework.Path
 	ret = append(ret, entPaths(b)...)
+	ret = append(ret, controlGroupPaths(b)...)
 	ret = append(ret, b.configPaths()...)
 	ret = append(ret, b.rekeyPaths()...)
 	ret = append(ret, b.sealPaths()...)

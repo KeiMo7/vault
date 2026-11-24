@@ -19,14 +19,6 @@ func waitForReplicationState(context.Context, *Core, *logical.Request) (*sync.Wa
 	return nil, nil
 }
 
-func checkNeedsCG(context.Context, *Core, *logical.Request, *logical.Auth, error, []string) (error, *logical.Response, *logical.Auth, error) {
-	return nil, nil, nil, nil
-}
-
-func checkErrControlGroupTokenNeedsCreated(err error) bool {
-	return false
-}
-
 func shouldForward(c *Core, resp *logical.Response, err error) bool {
 	return false
 }

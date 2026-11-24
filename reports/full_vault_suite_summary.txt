@@ -1,0 +1,8 @@
+--- FAIL: TestExternalPluginInContainer_MountAndUnmount (1.17s)
+--- FAIL: TestSystemBackend_PluginCatalog_ContainerCRUD (0.20s)
+--- FAIL: TestSystemBackend_pluginRuntime_CannotDeleteRuntimeWithReferencingPlugins (0.19s)
+FAIL
+FAIL	github.com/hashicorp/vault/vault	300.422s
+FAIL
+
+[exited with code 0]

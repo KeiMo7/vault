@@ -5,6 +5,7 @@ package vault
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -418,6 +419,118 @@ func TestPolicy_ParseControlGroup(t *testing.T) {
 
 	if len(permFactors[0].ControlledCapabilities) != 1 && permFactors[0].ControlledCapabilities[0] != "create" {
 		t.Fatalf("controlled_capabilities on the first factor was not correct: %+v", permFactors[0].ControlledCapabilities)
+	}
+}
+
+// TestPolicy_ParseControlGroupValidation ensures misconfigured control groups
+// are rejected at policy-write time rather than failing at request time.
+func TestPolicy_ParseControlGroupValidation(t *testing.T) {
+	cases := map[string]struct {
+		controlGroup string
+		wantErr      string
+	}{
+		"missing max_ttl is allowed for compatibility": {
+			controlGroup: `
+				factor "ops" {
+					identity {
+						group_names = ["ops"]
+						approvals = 1
+					}
+				}`,
+			wantErr: "",
+		},
+		"negative max_ttl": {
+			controlGroup: `
+				max_ttl = "-1h"
+				factor "ops" {
+					identity {
+						group_names = ["ops"]
+						approvals = 1
+					}
+				}`,
+			wantErr: "cannot be negative",
+		},
+		"ttl and max_ttl together": {
+			controlGroup: `
+				ttl = "1h"
+				max_ttl = "2h"
+				factor "ops" {
+					identity {
+						group_names = ["ops"]
+						approvals = 1
+					}
+				}`,
+			wantErr: "only one of",
+		},
+		"no factors": {
+			controlGroup: `max_ttl = "1h"`,
+			wantErr:      "no control group factors provided",
+		},
+		"factor without identity": {
+			controlGroup: `
+				max_ttl = "1h"
+				factor "ops" {
+				}`,
+			wantErr: "no control_group factor provided",
+		},
+		"zero approvals": {
+			controlGroup: `
+				max_ttl = "1h"
+				factor "ops" {
+					identity {
+						group_names = ["ops"]
+						approvals = 0
+					}
+				}`,
+			wantErr: "approvals > 0",
+		},
+		"no groups": {
+			controlGroup: `
+				max_ttl = "1h"
+				factor "ops" {
+					identity {
+						approvals = 1
+					}
+				}`,
+			wantErr: "at least one group",
+		},
+		"empty group name": {
+			controlGroup: `
+				max_ttl = "1h"
+				factor "ops" {
+					identity {
+						group_names = [""]
+						approvals = 1
+					}
+				}`,
+			wantErr: "empty identity group",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(fmt.Sprintf(`
+name = "cg"
+path "secret/*" {
+	capabilities = ["create", "read", "update"]
+	control_group = {
+		%s
+	}
+}
+`, tc.controlGroup)))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected policy to parse, got error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected policy write to fail")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
 	}
 }
 
