@@ -132,3 +132,34 @@ func (c *Core) FetchLeaseCountToRevoke() int {
 	defer c.expiration.pendingLock.RUnlock()
 	return c.expiration.leaseCount
 }
+
+// Expiration returns the core's expiration manager. It is intended for use by
+// tests in external packages (such as the http package) that need to observe
+// lease-restore state. It may return nil while the core is sealed.
+func (c *Core) Expiration() *ExpirationManager {
+	return c.expiration
+}
+
+// InRestoreMode reports whether the expiration manager is still restoring
+// lease state. It is intended for use by external-package tests.
+func (m *ExpirationManager) InRestoreMode() bool {
+	return m.inRestoreMode()
+}
+
+// RenewGateForTest returns the core's renewal gate. It is intended for use by
+// external-package tests that need to inspect gate internals.
+func (c *Core) RenewGateForTest() *RenewGate {
+	return c.renewGate
+}
+
+// DedupForTest returns a snapshot of the gate's idempotency cache keys. It is
+// intended for use by external-package tests.
+func (g *RenewGate) DedupForTest() map[renewKey]renewCacheEntry {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make(map[renewKey]renewCacheEntry, len(g.dedup))
+	for k, v := range g.dedup {
+		out[k] = v
+	}
+	return out
+}

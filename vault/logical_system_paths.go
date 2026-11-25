@@ -3503,6 +3503,10 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
 					Type:        framework.TypeDurationSecond,
 					Description: strings.TrimSpace(sysHelp["increment"][0]),
 				},
+				"renewal_id": {
+					Type:        framework.TypeString,
+					Description: "An optional identifier used to de-duplicate identical renewal retries. Defaults to the request ID when omitted.",
+				},
 			},
 
 			Operations: map[logical.Operation]framework.OperationHandler{
@@ -3757,6 +3761,68 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
 
 			HelpSynopsis:    strings.TrimSpace(sysHelp["list-leases"][0]),
 			HelpDescription: strings.TrimSpace(sysHelp["list-leases"][1]),
+		},
+
+		{
+			Pattern: "leases/renewal-status$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "leases",
+				OperationVerb:   "read-renewal-status",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: b.handleRenewalStatus,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"state": {
+									Type:        framework.TypeString,
+									Description: "Current renewal gate state: sealed, restoring, or open.",
+									Required:    true,
+								},
+								"epoch": {
+									Type:        framework.TypeInt64,
+									Description: "Monotonic gate epoch bumped on each seal and restore boundary.",
+									Required:    true,
+								},
+								"inflight": {
+									Type:        framework.TypeInt,
+									Description: "Number of renewal attempts currently in flight. Contains no lease or token identifiers.",
+									Required:    true,
+								},
+								"sealed_rejections": {
+									Type:        framework.TypeInt64,
+									Description: "Count of renewal attempts rejected because the gate was sealed.",
+									Required:    true,
+								},
+								"stale_commits": {
+									Type:        framework.TypeInt64,
+									Description: "Count of renewal commits rejected because they targeted a stale epoch.",
+									Required:    true,
+								},
+								"restore_completed_at": {
+									Type:        framework.TypeTime,
+									Description: "Timestamp the most recent lease restore completed; zero when no restore has finished.",
+									Required:    false,
+								},
+							},
+						}},
+					},
+					Summary: "Read renewal gate status and counters.",
+				},
+			},
+
+			HelpSynopsis: "Read the lease renewal gate state and counters.",
+			HelpDescription: strings.TrimSpace(`
+The sys/leases/renewal-status endpoint reports the state of the internal renewal gate
+that guards lease and token renewal across seal and restore boundaries. It returns the
+gate state (sealed, restoring, or open), the monotonic epoch, the number of in-flight
+renewal attempts, cumulative sealed-rejection and stale-commit counters, and the time
+the most recent restore completed. The response deliberately excludes all lease IDs,
+token IDs and token accessors. This is a sudo (root) protected, read-only endpoint.`),
 		},
 	}
 }

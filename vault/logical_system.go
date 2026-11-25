@@ -193,6 +193,7 @@ func NewSystemBackend(core *Core, logger log.Logger, config *logical.BackendConf
 				"leases/revoke-prefix/*",
 				"leases/revoke-force/*",
 				"leases/lookup/*",
+				"leases/renewal-status",
 				"storage/raft/snapshot-auto/config/*",
 				"leases",
 				"reporting/scan",
@@ -3656,13 +3657,44 @@ func (b *SystemBackend) handleRenew(ctx context.Context, req *logical.Request, d
 	// Convert the increment
 	increment := time.Duration(incrementRaw) * time.Second
 
+	// Carry the optional renewal_id through to the expiration manager so
+	// identical retries are merged by the idempotency cache.
+	if renewalID, ok := data.GetOk("renewal_id"); ok {
+		if s, ok := renewalID.(string); ok && s != "" {
+			if req.Data == nil {
+				req.Data = make(map[string]interface{})
+			}
+			req.Data["renewal_id"] = s
+		}
+	}
+
 	// Invoke the expiration manager directly
-	resp, err := b.Core.expiration.Renew(ctx, leaseID, increment)
+	resp, err := b.Core.expiration.RenewWithRequest(ctx, req, leaseID, increment)
 	if err != nil {
 		b.Backend.Logger().Error("lease renewal failed", "lease_id", leaseID, "error", err)
 		return handleErrorNoReadOnlyForward(err)
 	}
 	return resp, err
+}
+
+// handleRenewalStatus serves the read-only sys/leases/renewal-status endpoint.
+// It returns a projection of the Core-mounted RenewGate's state containing only
+// counters and the epoch; no lease ID, token ID or accessor is ever included.
+func (b *SystemBackend) handleRenewalStatus(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	if b.Core == nil || b.Core.renewGate == nil {
+		return nil, ErrRenewGateUnavailable
+	}
+	snap := b.Core.renewGate.Snapshot()
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"state":                snap.State,
+			"epoch":                snap.Epoch,
+			"inflight":             snap.Inflight,
+			"sealed_rejections":    snap.SealedRejections,
+			"stale_commits":        snap.StaleCommits,
+			"restore_completed_at": snap.RestoreCompletedAt,
+		},
+	}, nil
 }
 
 // handleRevoke is used to revoke a given LeaseID

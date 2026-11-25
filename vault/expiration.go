@@ -179,6 +179,11 @@ type ExpirationManager struct {
 
 	jobManager      *fairshare.JobManager
 	revokeRetryBase time.Duration
+
+	// renewStore abstracts lease load/persist for the renewal path so tests can
+	// inject a counting or blocking implementation. When nil, the manager
+	// falls back to an expirationStore adapter over loadEntry/persistEntry.
+	renewStore RenewStore
 }
 
 type ExpireLeaseStrategy func(context.Context, *ExpirationManager, string, *namespace.Namespace)
@@ -404,6 +409,12 @@ func NewExpirationManager(c *Core, view *BarrierView, e ExpireLeaseStrategy, log
 	}
 	*exp.restoreMode = 1
 
+	// Drive the Core-mounted renew gate into the restoring state. The gate is
+	// mounted on Core so it outlives this manager instance across seal cycles.
+	if c.renewGate != nil {
+		c.renewGate.BeginRestore()
+	}
+
 	if exp.logger == nil {
 		opts := log.LoggerOptions{Name: "expiration_manager"}
 		exp.logger = log.New(&opts)
@@ -499,6 +510,20 @@ func (m *ExpirationManager) unlockLease(leaseID string) {
 // inRestoreMode returns if we are currently in restore mode
 func (m *ExpirationManager) inRestoreMode() bool {
 	return atomic.LoadInt32(m.restoreMode) == 1
+}
+
+// quitChClosed reports whether the manager's quit channel has been closed,
+// meaning Stop has been invoked. It performs a non-blocking select.
+func (m *ExpirationManager) quitChClosed() bool {
+	if m == nil || m.quitCh == nil {
+		return true
+	}
+	select {
+	case <-m.quitCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *ExpirationManager) invalidate(key string) {
@@ -715,6 +740,12 @@ func (m *ExpirationManager) Restore(errorFunc func()) (retErr error) {
 
 		switch {
 		case retErr == nil:
+			// Restore succeeded. Open the renew gate unless the manager has been
+			// stopped (quitCh closed) while restore was running, in which case a
+			// seal is already in flight and the gate must remain sealed.
+			if m != nil && m.core != nil && m.core.renewGate != nil && !m.quitChClosed() {
+				m.core.renewGate.OpenAfterRestore()
+			}
 		case strings.Contains(retErr.Error(), context.Canceled.Error()):
 			// Don't run error func because we lost leadership
 			m.logger.Warn("context canceled while restoring leases, stopping lease loading")
@@ -904,6 +935,13 @@ func (m *ExpirationManager) Stop() error {
 	// Stop all the pending expiration timers
 	m.logger.Debug("stop triggered")
 	defer m.logger.Debug("finished stopping")
+
+	// Move the renew gate to sealed before tearing anything else down so that
+	// in-flight renewals are aborted and no new renewals begin. Seal is
+	// idempotent and tolerates a nil core/gate.
+	if m != nil && m.core != nil && m.core.renewGate != nil {
+		m.core.renewGate.Seal()
+	}
 
 	m.jobManager.Stop()
 
@@ -1296,26 +1334,80 @@ func (m *ExpirationManager) revokePrefixCommon(ctx context.Context, prefix strin
 // Renew is used to renew a secret using the given leaseID
 // and a renew interval. The increment may be ignored.
 func (m *ExpirationManager) Renew(ctx context.Context, leaseID string, increment time.Duration) (*logical.Response, error) {
+	return m.RenewWithRequest(ctx, nil, leaseID, increment)
+}
+
+// RenewWithRequest is the request-aware variant of Renew. It carries the
+// logical request so that the renewal can derive the renewal_id and the caller
+// accessor used by the idempotency cache and the renew gate. A nil req keeps
+// the legacy Renew semantics (no de-duplication). Renew retains its original
+// signature for existing callers and delegates here.
+func (m *ExpirationManager) RenewWithRequest(ctx context.Context, req *logical.Request, leaseID string, increment time.Duration) (*logical.Response, error) {
 	defer metrics.MeasureSince([]string{"expire", "renew"}, time.Now())
+
+	gate := m.gate()
+	if err := gate.CheckSealed(); err != nil {
+		return nil, err
+	}
+
+	// Resolve the idempotency key inputs up front. The caller accessor for a
+	// secret lease renewal comes from the request's client token accessor.
+	renewalID := renewalIDFromRequest(req)
+	callerAccessor := ""
+	if req != nil {
+		callerAccessor = req.ClientTokenAccessor
+	}
+
+	// Begin the gate attempt before taking the per-lease lock or loading the
+	// entry. The namespace ID and prior expiration are backfilled after load.
+	attempt, err := gate.Begin(ctx, req, leaseID, increment, callerAccessor)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the request is canceled before any durable work happens, abort without
+	// writing to the barrier.
+	if err := ctx.Err(); err != nil {
+		gate.Abort(attempt, err)
+		return nil, err
+	}
 
 	// Acquire lock for this lease
 	leaseLock := m.lockForLeaseID(leaseID)
 	leaseLock.Lock()
 	defer leaseLock.Unlock()
 
-	// Load the entry
-	le, err := m.loadEntry(ctx, leaseID)
+	// After acquiring the per-lease lock, re-check the de-duplication cache so
+	// waiters observe a response committed by a prior holder of the lock. The
+	// namespace comes from the request context; the cross-namespace check below
+	// guarantees it matches the loaded lease's namespace.
+	if renewalID != "" {
+		nsID := namespace.RootNamespaceID
+		if reqNS, nsErr := namespace.FromContext(ctx); nsErr == nil && reqNS != nil {
+			nsID = reqNS.ID
+		}
+		if cached, ok := gate.LookupDedup(renewKeyFor(nsID, leaseID, renewalID, callerAccessor)); ok {
+			gate.Abort(attempt, nil)
+			return cached, nil
+		}
+	}
+
+	// Load the entry through the injectable store.
+	le, err := m.renewStoreFor().Load(ctx, leaseID)
 	if err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 
 	// Check if the lease is renewable
 	if _, err := le.renewable(); err != nil {
 		m.sendLeaseEvent(ctx, le, leaseEventTypeRenewFailed, leaseOperationRenew, false)
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 
 	if le.Secret == nil {
+		gate.Abort(attempt, logical.ErrInvalidRequest)
 		if le.Auth != nil {
 			return logical.ErrorResponse("tokens cannot be renewed through this endpoint"), nil
 		}
@@ -1324,39 +1416,56 @@ func (m *ExpirationManager) Renew(ctx context.Context, leaseID string, increment
 
 	ns, err := namespace.FromContext(ctx)
 	if err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 	if ns.ID != le.namespace.ID {
-		return nil, errors.New("cannot renew a lease across namespaces")
+		err := errors.New("cannot renew a lease across namespaces")
+		gate.Abort(attempt, err)
+		return nil, err
+	}
+
+	// Backfill attempt identity now that the namespace is known.
+	attempt.NamespaceID = le.namespace.ID
+	attempt.PrevExpireTime = le.ExpireTime
+	if renewalID != "" {
+		attempt.markCacheable(renewKeyFor(le.namespace.ID, leaseID, renewalID, callerAccessor))
 	}
 
 	sysViewCtx := namespace.ContextWithNamespace(ctx, le.namespace)
 	sysView := m.router.MatchingSystemView(sysViewCtx, le.Path)
 	if sysView == nil {
-		return nil, fmt.Errorf("unable to retrieve system view from router")
+		err := fmt.Errorf("unable to retrieve system view from router")
+		gate.Abort(attempt, err)
+		return nil, err
 	}
 
 	// Attempt to renew the entry
 	resp, err := m.renewEntry(ctx, le, increment)
 	if err != nil {
 		m.sendLeaseEvent(ctx, le, leaseEventTypeRenewFailed, leaseOperationRenew, false)
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 	if resp == nil {
+		gate.Abort(attempt, nil)
 		return nil, nil
 	}
 	if resp.IsError() {
 		m.sendLeaseEvent(ctx, le, leaseEventTypeRenewFailed, leaseOperationRenew, false)
+		gate.Abort(attempt, logical.ErrInvalidRequest)
 		return &logical.Response{
 			Data: resp.Data,
 		}, nil
 	}
 	if resp.Secret == nil {
+		gate.Abort(attempt, nil)
 		return nil, nil
 	}
 
 	ttl, warnings, err := framework.CalculateTTL(sysView, increment, resp.Secret.TTL, 0, resp.Secret.MaxTTL, 0, le.IssueTime)
 	if err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 	for _, warning := range warnings {
@@ -1367,55 +1476,72 @@ func (m *ExpirationManager) Renew(ctx context.Context, leaseID string, increment
 	// Attach the LeaseID
 	resp.Secret.LeaseID = leaseID
 
-	// Update the lease entry
-	le.Data = resp.Data
-	le.Secret = resp.Secret
-	le.ExpireTime = resp.Secret.ExpirationTime()
-	le.LastRenewalTime = time.Now()
+	// Work on a copy of the lease entry so that a failed persistence leaves the
+	// in-memory entry unchanged and the existing timer keeps running.
+	updated := *le
+	updated.Data = resp.Data
+	updated.Secret = resp.Secret
+	updated.ExpireTime = resp.Secret.ExpirationTime()
+	updated.LastRenewalTime = gate.nowForRenew()
 
 	// If the token it's associated with is a batch token, constrain lease
 	// times
-	if le.ClientTokenType == logical.TokenTypeBatch {
-		te, err := m.tokenStore.Lookup(ctx, le.ClientToken)
+	if updated.ClientTokenType == logical.TokenTypeBatch {
+		te, err := m.tokenStore.Lookup(ctx, updated.ClientToken)
 		if err != nil {
+			gate.Abort(attempt, err)
 			return nil, err
 		}
 		if te == nil {
-			return nil, errors.New("cannot renew lease, no valid associated token")
+			err := errors.New("cannot renew lease, no valid associated token")
+			gate.Abort(attempt, err)
+			return nil, err
 		}
 		tokenLeaseTimes, err := m.FetchLeaseTimesByToken(ctx, te)
 		if err != nil {
+			gate.Abort(attempt, err)
 			return nil, err
 		}
 
 		if tokenLeaseTimes == nil {
-			return nil, errors.New("failed to load batch token expiration time")
+			err := errors.New("failed to load batch token expiration time")
+			gate.Abort(attempt, err)
+			return nil, err
 		}
 
-		if le.ExpireTime.After(tokenLeaseTimes.ExpireTime) {
-			resp.Secret.TTL = tokenLeaseTimes.ExpireTime.Sub(le.LastRenewalTime)
-			le.ExpireTime = tokenLeaseTimes.ExpireTime
+		if updated.ExpireTime.After(tokenLeaseTimes.ExpireTime) {
+			resp.Secret.TTL = tokenLeaseTimes.ExpireTime.Sub(updated.LastRenewalTime)
+			updated.ExpireTime = tokenLeaseTimes.ExpireTime
 		}
 	}
 
-	if err := m.persistEntry(ctx, le); err != nil {
+	// Persist first. A failure aborts the attempt and never touches pending.
+	if err := m.renewStoreFor().Persist(ctx, &updated); err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 
-	err = m.core.observations.RecordObservationToLedger(ctx, observations.ObservationTypeLeaseRenewNonAuth, le.namespace, map[string]interface{}{
+	// Record the resulting expiration and commit the gate before mutating
+	// in-memory pending state. A commit failure (seal or stale epoch) must not
+	// roll back the barrier write.
+	attempt.NextExpireTime = updated.ExpireTime
+	if err := gate.Commit(attempt, resp); err != nil {
+		return nil, err
+	}
+
+	// Update the in-memory expiration timer only after a durable commit.
+	m.updatePending(&updated)
+
+	m.sendLeaseEvent(ctx, &updated, leaseEventTypeRenewed, leaseOperationRenew, true)
+
+	if err := m.core.observations.RecordObservationToLedger(ctx, observations.ObservationTypeLeaseRenewNonAuth, updated.namespace, map[string]interface{}{
 		"lease_id":    leaseID,
-		"path":        le.Path,
-		"issue_time":  le.IssueTime,
-		"expire_time": le.ExpireTime,
-	})
-	if err != nil {
+		"path":        updated.Path,
+		"issue_time":  updated.IssueTime,
+		"expire_time": updated.ExpireTime,
+	}); err != nil {
 		return nil, err
 	}
-
-	// Update the expiration time
-	m.updatePending(le)
-
-	m.sendLeaseEvent(ctx, le, leaseEventTypeRenewed, leaseOperationRenew, true)
 
 	// Return the response
 	return resp, nil
@@ -1427,6 +1553,14 @@ func (m *ExpirationManager) RenewToken(ctx context.Context, req *logical.Request
 	increment time.Duration,
 ) (*logical.Response, error) {
 	defer metrics.MeasureSince([]string{"expire", "renew-token"}, time.Now())
+
+	gate := m.gate()
+
+	// Seal check and gate begin happen first, before namespace resolution and
+	// the SaltID lease ID computation, so a sealed node never touches storage.
+	if err := gate.CheckSealed(); err != nil {
+		return nil, err
+	}
 
 	tokenNS, err := NamespaceByID(ctx, te.NamespaceID, m.core)
 	if err != nil {
@@ -1456,17 +1590,43 @@ func (m *ExpirationManager) RenewToken(ctx context.Context, req *logical.Request
 		leaseID = fmt.Sprintf("%s.%s", leaseID, ns.ID)
 	}
 
+	// For token renewals the caller accessor is the token entry's accessor.
+	callerAccessor := te.Accessor
+	renewalID := renewalIDFromRequest(req)
+
+	// Begin before taking the per-lease lock or loading the entry.
+	attempt, err := gate.Begin(ctx, req, leaseID, increment, callerAccessor)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := ctx.Err(); err != nil {
+		gate.Abort(attempt, err)
+		return nil, err
+	}
+
 	// Acquire lock for this lease
 	leaseLock := m.lockForLeaseID(leaseID)
 	leaseLock.Lock()
 	defer leaseLock.Unlock()
 
-	// Load the entry
-	le, err := m.loadEntry(ctx, leaseID)
+	// Re-check the idempotency cache after acquiring the lock so concurrent
+	// waiters merge onto the first successful renewal.
+	if renewalID != "" {
+		if cached, ok := gate.LookupDedup(renewKeyFor(tokenNS.ID, leaseID, renewalID, callerAccessor)); ok {
+			gate.Abort(attempt, nil)
+			return cached, nil
+		}
+	}
+
+	// Load the entry through the injectable store.
+	le, err := m.renewStoreFor().Load(ctx, leaseID)
 	if err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 	if le == nil {
+		gate.Abort(attempt, logical.ErrInvalidRequest)
 		return logical.ErrorResponse("invalid lease ID"), logical.ErrInvalidRequest
 	}
 
@@ -1474,36 +1634,49 @@ func (m *ExpirationManager) RenewToken(ctx context.Context, req *logical.Request
 	// lease and errors in that case as well.
 	if _, err := le.renewable(); err != nil {
 		m.sendLeaseEvent(ctx, le, leaseEventTypeRenewFailed, leaseOperationRenew, false)
+		gate.Abort(attempt, err)
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+	}
+
+	attempt.PrevExpireTime = le.ExpireTime
+	if renewalID != "" {
+		attempt.markCacheable(renewKeyFor(tokenNS.ID, leaseID, renewalID, callerAccessor))
 	}
 
 	// Attempt to renew the auth entry
 	resp, err := m.renewAuthEntry(ctx, req, le, increment)
 	if err != nil {
 		m.sendLeaseEvent(ctx, le, leaseEventTypeRenewFailed, leaseOperationRenew, false)
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 	if resp == nil {
+		gate.Abort(attempt, nil)
 		return nil, nil
 	}
 	if resp.IsError() {
 		m.sendLeaseEvent(ctx, le, leaseEventTypeRenewFailed, leaseOperationRenew, false)
+		gate.Abort(attempt, logical.ErrInvalidRequest)
 		return &logical.Response{
 			Data: resp.Data,
 		}, nil
 	}
 	if resp.Auth == nil {
+		gate.Abort(attempt, nil)
 		return nil, nil
 	}
 
 	sysViewCtx := namespace.ContextWithNamespace(ctx, le.namespace)
 	sysView := m.router.MatchingSystemView(sysViewCtx, le.Path)
 	if sysView == nil {
-		return nil, fmt.Errorf("unable to retrieve system view from router")
+		err := fmt.Errorf("unable to retrieve system view from router")
+		gate.Abort(attempt, err)
+		return nil, err
 	}
 
 	ttl, warnings, err := framework.CalculateTTL(sysView, increment, resp.Auth.TTL, resp.Auth.Period, resp.Auth.MaxTTL, resp.Auth.ExplicitMaxTTL, le.IssueTime)
 	if err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 	retResp := &logical.Response{}
@@ -1523,35 +1696,47 @@ func (m *ExpirationManager) RenewToken(ctx context.Context, req *logical.Request
 		}
 		validAliases, err := m.core.identityStore.refreshExternalGroupMembershipsByEntityID(ctx, resp.Auth.EntityID, resp.Auth.GroupAliases, mountAccessor)
 		if err != nil {
+			gate.Abort(attempt, err)
 			return nil, err
 		}
 		resp.Auth.GroupAliases = validAliases
 	}
 
-	// Update the lease entry
-	le.Auth = resp.Auth
-	le.ExpireTime = resp.Auth.ExpirationTime()
-	le.LastRenewalTime = time.Now()
+	// Work on a copy so that a failed persistence preserves the original
+	// in-memory lease entry and its running timer.
+	updated := *le
+	updated.Auth = resp.Auth
+	updated.ExpireTime = resp.Auth.ExpirationTime()
+	updated.LastRenewalTime = gate.nowForRenew()
 
-	if err := m.persistEntry(ctx, le); err != nil {
+	// Persist first; abort without touching pending on failure.
+	if err := m.renewStoreFor().Persist(ctx, &updated); err != nil {
+		gate.Abort(attempt, err)
 		return nil, err
 	}
 
-	m.updatePending(le)
-
-	err = m.core.observations.RecordObservationToLedger(ctx, observations.ObservationTypeLeaseRenewAuth, le.namespace, map[string]interface{}{
-		"lease_id":    leaseID,
-		"path":        le.Path,
-		"issue_time":  le.IssueTime,
-		"expire_time": le.ExpireTime,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	m.sendLeaseEvent(ctx, le, leaseEventTypeRenewed, leaseOperationRenew, true)
-
+	// Commit before updating in-memory pending. The barrier write above is
+	// intentionally not rolled back if this fails. Populate the response auth
+	// first so the idempotency cache stores the complete response.
 	retResp.Auth = resp.Auth
+	attempt.NextExpireTime = updated.ExpireTime
+	if err := gate.Commit(attempt, retResp); err != nil {
+		return nil, err
+	}
+
+	m.updatePending(&updated)
+
+	m.sendLeaseEvent(ctx, &updated, leaseEventTypeRenewed, leaseOperationRenew, true)
+
+	if err := m.core.observations.RecordObservationToLedger(ctx, observations.ObservationTypeLeaseRenewAuth, updated.namespace, map[string]interface{}{
+		"lease_id":    leaseID,
+		"path":        updated.Path,
+		"issue_time":  updated.IssueTime,
+		"expire_time": updated.ExpireTime,
+	}); err != nil {
+		return nil, err
+	}
+
 	return retResp, nil
 }
 
@@ -2015,6 +2200,32 @@ func (m *ExpirationManager) updatePending(le *leaseEntry) {
 	m.updatePendingInternal(le)
 }
 
+// updatePendingRestore is the restore-time variant of updatePending. It applies
+// the same pending bookkeeping as updatePending except for one monotonic
+// guarantee: when both the incoming snapshot and the already-cached lease have
+// non-zero expiration times and the incoming value is older (earlier) than the
+// cached value, the cached expiration time and its running timer are preserved.
+// This prevents a stale restore snapshot from shortening a lease that a
+// concurrent renewal has already extended. A normal updatePending remains the
+// authoritative write and may still shorten the TTL to match the backend.
+// Zero expiration times, non-renewable leases and the nonexpiring/irrevocable
+// paths continue to follow the existing updatePending logic unchanged.
+func (m *ExpirationManager) updatePendingRestore(le *leaseEntry) {
+	m.pendingLock.Lock()
+	defer m.pendingLock.Unlock()
+
+	if raw, ok := m.pending.Load(le.LeaseID); ok && !le.ExpireTime.IsZero() {
+		if cached := raw.(pendingInfo).cachedLeaseInfo; cached != nil &&
+			!cached.ExpireTime.IsZero() && le.ExpireTime.Before(cached.ExpireTime) {
+			// Keep the later expiration: retain the cached timer and lease info,
+			// do not let the older snapshot reset it.
+			return
+		}
+	}
+
+	m.updatePendingInternal(le)
+}
+
 // sendLeaseEvent sends an event notification for a lease operations
 func (m *ExpirationManager) sendLeaseEvent(ctx context.Context, le *leaseEntry, eventType string, operation string, modified bool) {
 	if le == nil || le.namespace == nil || m.core == nil || m.core.events == nil {
@@ -2313,8 +2524,10 @@ func (m *ExpirationManager) loadEntryInternal(ctx context.Context, leaseID strin
 		// the lazy loaded restore process
 		m.restoreLoaded.Store(le.LeaseID, struct{}{})
 
-		// Setup revocation timer
-		m.updatePending(le)
+		// Setup revocation timer. Restores are protected monotonically: a stale
+		// snapshot must never shorten a lease that a concurrent renewal has
+		// already extended.
+		m.updatePendingRestore(le)
 	}
 	return le, nil
 }

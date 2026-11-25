@@ -511,6 +511,10 @@ func (ts *TokenStore) paths() []*framework.Path {
 					Default:     0,
 					Description: "The desired increment in seconds to the token expiration",
 				},
+				"renewal_id": {
+					Type:        framework.TypeString,
+					Description: "An optional identifier used to de-duplicate identical renewal retries. Defaults to the request ID when omitted.",
+				},
 			},
 
 			Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -540,6 +544,10 @@ func (ts *TokenStore) paths() []*framework.Path {
 					Default:     0,
 					Description: "The desired increment in seconds to the token expiration",
 				},
+				"renewal_id": {
+					Type:        framework.TypeString,
+					Description: "An optional identifier used to de-duplicate identical renewal retries. Defaults to the request ID when omitted.",
+				},
 			},
 
 			Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -567,6 +575,10 @@ func (ts *TokenStore) paths() []*framework.Path {
 					Type:        framework.TypeDurationSecond,
 					Default:     0,
 					Description: "The desired increment in seconds to the token expiration",
+				},
+				"renewal_id": {
+					Type:        framework.TypeString,
+					Description: "An optional identifier used to de-duplicate identical renewal retries. Defaults to the request ID when omitted.",
 				},
 			},
 
@@ -2640,10 +2652,16 @@ func (ts *TokenStore) handleUpdateRenewAccessor(ctx context.Context, req *logica
 			"increment": {
 				Type: framework.TypeDurationSecond,
 			},
+			"renewal_id": {
+				Type: framework.TypeString,
+			},
 		},
 	}
 	if inc, ok := data.GetOk("increment"); ok {
 		d.Raw["increment"] = inc
+	}
+	if renewalID, ok := data.GetOk("renewal_id"); ok {
+		d.Raw["renewal_id"] = renewalID
 	}
 
 	resp, err := ts.handleRenew(ctx, req, d)
@@ -3741,6 +3759,14 @@ func (ts *TokenStore) handleRenewSelf(ctx context.Context, req *logical.Request,
 // handleRenew handles the auth/token/renew/id path for renewal of tokens.
 // This is used to prevent token expiration and revocation.
 func (ts *TokenStore) handleRenew(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	// Check the seal state before any token lookup or normalization so a sealed
+	// node rejects renewals without touching the barrier.
+	if ts.core != nil && ts.core.renewGate != nil {
+		if err := ts.core.renewGate.CheckSealed(); err != nil {
+			return nil, err
+		}
+	}
+
 	id := data.Get("token").(string)
 	if id == "" {
 		return logical.ErrorResponse("missing token ID"), logical.ErrInvalidRequest
@@ -3756,6 +3782,18 @@ func (ts *TokenStore) handleRenew(ctx context.Context, req *logical.Request, dat
 
 	// Convert the increment
 	increment := time.Duration(incrementRaw) * time.Second
+
+	// Propagate the optional renewal_id from the field data onto the request so
+	// the expiration manager's idempotency cache can key on it. This covers the
+	// renew-accessor path, which builds a synthetic FieldData.
+	if renewalID, ok := data.GetOk("renewal_id"); ok {
+		if s, ok := renewalID.(string); ok && s != "" {
+			if req.Data == nil {
+				req.Data = make(map[string]interface{})
+			}
+			req.Data["renewal_id"] = s
+		}
+	}
 
 	// Lookup the token
 	te, err := ts.Lookup(ctx, id)

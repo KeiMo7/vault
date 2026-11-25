@@ -454,6 +454,13 @@ type Core struct {
 	// renewal, expiration and revocation
 	expiration *ExpirationManager
 
+	// renewGate guards renewal processing across seal and restore boundaries.
+	// It is mounted on Core (rather than the ExpirationManager) so that its
+	// epoch and counters survive the recreation of the expiration manager that
+	// happens on every seal/unseal cycle, since stopExpiration nils out
+	// c.expiration.
+	renewGate *RenewGate
+
 	// the rotation manager handles periodic rotation of credentials
 	rotationManager *RotationManager
 
@@ -1265,6 +1272,10 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 	}
 
 	c.certCountManager = cert_count.InitCertificateCountManager(c.logger, c.certCountConsumerJobInterval)
+
+	// The renew gate starts sealed; the expiration manager drives it through
+	// BeginRestore/OpenAfterRestore during unseal and Seal during sealing.
+	c.renewGate = NewRenewGate(c.metricSink)
 
 	c.standbyStopCh.Store(make(chan struct{}))
 	atomic.StoreUint32(c.sealed, 1)
@@ -2621,6 +2632,13 @@ func (c *Core) sealInternal() error {
 }
 
 func (c *Core) sealInternalWithOptions(grabStateLock, keepHALock, performCleanup bool) error {
+	// Seal the renew gate before flipping the sealed flag. This aborts any
+	// in-flight renewals and blocks new ones ahead of the state transition.
+	// Seal is idempotent, so a repeated seal does not double-bump the epoch.
+	if c.renewGate != nil {
+		c.renewGate.Seal()
+	}
+
 	// Mark sealed, and if already marked return
 	if swapped := atomic.CompareAndSwapUint32(c.sealed, 0, 1); !swapped {
 		return nil
